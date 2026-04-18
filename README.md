@@ -8,5 +8,7 @@ Project for HACKU 2026 will incoporate an integrated app for the Android OS phon
 1:21 PM - It took me a while but i got the github set up with my local connecting to remote with obsidian also enacted to connection
 
 2:10 PM - just wiped everything, starting fresh sigh..
+
+2:53 PM - I basically got back to square one smh but i finally have everything working good ... i think ... i hope ... i pray
 ## Layout
 App design jargon yatta yatta
