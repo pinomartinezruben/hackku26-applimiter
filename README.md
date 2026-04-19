@@ -99,7 +99,9 @@ private fun promptForUsageStats() {
  [RUBEN, EXPLAIN WHY]
 
 From this implementaiton, there is an implemented `DENIED` state where the permissions to track are not given, therefore if we ran flutter in terminal such as:
+
     `PS C:\Users\pinom\projects\hackku_applimiter> flutter run`
+    
 Then we can expect a result like this:
 ```
 Resolving dependencies... 
@@ -162,7 +164,9 @@ W/ckku_applimiter(25286): userfaultfd: MOVE ioctl seems unsupported: Connection 
 ```
 
 While this wall of text is large and difficult to read, there should have been a line like that below:
+
     `D/UsageStatsCheck(25286): DENIED: promptForUsageStats() called.
+    
 However, there wasn't.. and to be honest i dont know why it did not show, my guess is that because there was a connection timeout on the last line that it may have been something to do with it, but that is an uneducated guess.
 
 So after terminal stayed with the most recent logging, I manually exited the app (without closing it), went to settings, and navigated to "Usage Data Access" on my Samsung phone. There I scrolled through the list of apps with a given toggle option, manually toggling my app to have Usage data access. Once I went back to VSCode on my laptop, i saw the following terminal output logs:
@@ -293,6 +297,7 @@ D/InputTransport(25286): Input channel constructed: 'ClientS', fd=178
 ```
 
 Again, wall of text and a bit overwhelming to read, but we actually see the line:
+
     `D/UsageStatsCheck(25286): GRANTED: PACKAGE_USAGE_STATS is active`
 
 This meant our native Kotlin code did connect with our Android OS system in our intended manner. The `AppOpsManager` in our `MainActivity.kt` sucessfully recognized that we manually fliped the switch in system settings and allowed the app to proceed.
