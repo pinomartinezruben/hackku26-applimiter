@@ -5,6 +5,12 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
+// imports needed for permissions checker
+import android.app.AppOpsManager // includes funcs: onResume(), evaluateUsageStatsPermission(), getSystemService
+import android.content.Context
+import android.os.Process
+import android.util.Log
+
 class MainActivity : FlutterActivity() {
     private val channelName = "uniqueChannelName"
 
@@ -19,5 +25,29 @@ class MainActivity : FlutterActivity() {
             }
 
         }
+    }
+
+    // implement function for permissions check
+    override fun onResume() {
+        super.onResume()
+        evaluateUsageStatsPermission()
+    }
+
+    private fun evaluateUsageStatsPermission() {
+        val appOps = getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+        val mode = appOps.unsafeCheckOpNoThrow(
+            AppOpsManager.OPSTR_GET_USAGE_STATS,
+            Process.myUid(),
+            packageName
+        )
+        if (mode == AppOpsManager.MODE_ALLOWED) {
+            Log.d("UsageStatsCheck", "GRANTED: PACKAGE_USAGE_STATS is active")
+        }
+        else {
+            promptForUsageStats()
+        }
+    }
+    private fun promptForUsageStats() {
+        Log.d("UsageStatsCheck", "DENIED: promptForUsageStats() called.")
     }
 }
