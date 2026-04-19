@@ -16,6 +16,18 @@ import android.content.pm.PackageManager
 import java.util.ArrayList
 import java.util.HashMap
 
+// imports needed for getting images of the android OS apps
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.Drawable
+import android.os.Build
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
+
 class MainActivity : FlutterActivity() {
     private val channelName = "uniqueChannelName"
 
@@ -25,12 +37,16 @@ class MainActivity : FlutterActivity() {
         val method = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
 
         method.setMethodCallHandler { call, result ->
-            if(call.method == "userName"){
+            if (call.method == "userName"){
                 Toast.makeText(this, "FreeTrained", Toast.LENGTH_LONG).show()
             }
             else if (call.method == "getInstalledApps") {
-                val appsList = getVisibleApps()
-                result.success(appsList)
+                CoroutineScope(Dispatchers.IO).launch {
+                    val appsList = getVisibleApps()
+                    withContext(Dispatchers.Main) {
+                        result.success(appsList)
+                    }
+                }
             }
             else {
                 result.notImplemented()
@@ -39,20 +55,51 @@ class MainActivity : FlutterActivity() {
     }
 
     // functions for implemention app list
-    private fun getVisibleApps(): List<Map<String, String>> {
+    private fun getVisibleApps(): List<Map<String, Any>> {
         val pm = context.packageManager
         val apps = pm.getInstalledApplications(PackageManager.GET_META_DATA)
-        val appList = ArrayList<Map<String, String>>()
+        val appList = ArrayList<Map<String, Any>>()
 
         for (appInfo in apps) {
             if (pm.getLaunchIntentForPackage(appInfo.packageName) != null) {
-                val appMap = HashMap <String, String>()
+                val appMap = HashMap <String, Any>()
                 appMap["name"] = appInfo.loadLabel(pm).toString()
                 appMap["packageId"] = appInfo.packageName
+
+                val iconDrawable = appInfo.loadIcon(pm)
+                val bitmap = drawableToBitmap(iconDrawable)
+                val stream = ByteArrayOutputStream()
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    bitmap.compress(Bitmap.CompressFormat.WEBP_LOSSY, 60, stream)
+                }
+                else {
+                    @Suppress("DEPRECATION")
+                    bitmap.compress(Bitmap.CompressFormat.WEBP, 60, stream)
+                }
+                appMap["icon"] = stream.toByteArray()
+
                 appList.add(appMap)
             }
         }
-        return appList.sortedBy {it["name"]?.lowercase()}
+        return appList.sortedBy {(it["name"] as String).lowercase()}
+    }
+
+    // implement function for app icon when searching for apps
+    private fun drawableToBitmap(drawable: Drawable): Bitmap {
+        if (drawable is BitmapDrawable && drawable.bitmap != null) {
+            return drawable.bitmap
+        }
+        val bitmap = if (drawable.intrinsicWidth <= 0 || drawable.intrinsicHeight <= 0) {
+            Bitmap.createBitmap(1,1, Bitmap.Config.ARGB_8888)
+        }
+        else {
+            Bitmap.createBitmap(drawable.intrinsicWidth, drawable.intrinsicHeight, Bitmap.Config.ARGB_8888)
+        }
+        val canvas  = Canvas(bitmap)
+        drawable.setBounds(0,0,canvas.width, canvas.height)
+        drawable.draw(canvas)
+        return bitmap
     }
 
     // implement function for permissions check
