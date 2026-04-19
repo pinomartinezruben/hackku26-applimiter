@@ -353,5 +353,8 @@ class MainActivity : FlutterActivity() {
 	    return appList.sortedBy {it["name"]?.lowercase()}  
 	}
 ```
+
+
+
 ## Layout
 App design jargon yatta yatta
