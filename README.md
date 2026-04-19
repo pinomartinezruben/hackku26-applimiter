@@ -302,5 +302,56 @@ Again, wall of text and a bit overwhelming to read, but we actually see the line
 
 This meant our native Kotlin code did connect with our Android OS system in our intended manner. The `AppOpsManager` in our `MainActivity.kt` sucessfully recognized that we manually fliped the switch in system settings and allowed the app to proceed.
 
+
+5:14 AM - 
+I was able to add a GUI to the mobile app, more documentation on that later
+
+--
+Implemented this (This is more added on top of what we arleady had, not a replacement if that makes sense):
+``` MainActivity.vt
+// imports needed for OS giving us app list  
+import android.content.pm.PackageManager  
+import java.util.ArrayList  
+import java.util.HashMap
+
+class MainActivity : FlutterActivity() {  
+    private val channelName = "uniqueChannelName"  
+  
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {  
+        super.configureFlutterEngine(flutterEngine)  
+  
+        val method = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)  
+  
+        method.setMethodCallHandler { call, result ->  
+            if(call.method == "userName"){  
+                Toast.makeText(this, "FreeTrained", Toast.LENGTH_LONG).show()  
+            }  
+            else if (call.method == "getInstalledApps") {  
+                val appsList = getVisibleApps()  
+                result.success(appsList)  
+            }  
+            else {  
+                result.notImplemented()  
+            }  
+        }  
+    }
+    
+	// functions for implemention app list  
+	private fun getVisibleApps(): List<Map<String, String>> {  
+	    val pm = context.packageManager  
+	    val apps = pm.getInstallApplications(PackageManager.GET_META_DATA)  
+	    val appList = ArrayList<Map<String, String>>()  
+	  
+	    for (appInfo in apps) {  
+	        if (pm.getLaunchIntentForPackage(appInfo.packageName) != null) {  
+	            val appMap = HashMap <String, String>()  
+	            appMap["name"] = appInfo.loadLabel(pm).toString()  
+	            appMap["packageId"] = appInfo.packageName  
+	            appList.add(addMap)  
+	        }  
+	    }  
+	    return appList.sortedBy {it["name"]?.lowercase()}  
+	}
+```
 ## Layout
 App design jargon yatta yatta
