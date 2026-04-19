@@ -6,7 +6,7 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
 // imports needed for permissions checker
-import android.app.AppOpsManager // includes funcs: onResume(), evaluateUsageStatsPermission(), getSystemService
+import android.app.AppOpsManager
 import android.content.Context
 import android.os.Process
 import android.util.Log
@@ -28,8 +28,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 
-//
-import android.content.Intent // Add this
+// imports needed for Services and Stats
+import android.content.Intent
+import android.app.usage.UsageStatsManager
+import java.util.Calendar
+import org.json.JSONObject
 
 class MainActivity : FlutterActivity() {
     private val channelName = "uniqueChannelName"
@@ -51,23 +54,77 @@ class MainActivity : FlutterActivity() {
                     }
                 }
             }
-            // --- NEW: Handle Config Save and Start Service ---
             else if (call.method == "saveLimiterConfig") {
-                val jsonString = call.arguments as String
+                val configJson = call.argument<String>("config")
 
-                // Save JSON natively
+                if (configJson == null) {
+                    result.error("INVALID_ARG", "config argument is null", null)
+                    return@setMethodCallHandler
+                }
+
+                // ── 1. Persist to native SharedPreferences ────────────────────────────
                 val prefs = getSharedPreferences("AppLimiterPrefs", Context.MODE_PRIVATE)
-                prefs.edit().putString("limiterConfig", jsonString).apply()
+                prefs.edit().putString("limiterConfig", configJson).apply()
 
-                // Boot the Native Background Engine
+                // ── 2. Boot LimiterService ────────────────────────────────────────────
                 val serviceIntent = Intent(this, LimiterService::class.java)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
                     startForegroundService(serviceIntent)
                 } else {
                     startService(serviceIntent)
                 }
 
-                result.success(true)
+                result.success(null)
+            }
+            else if (call.method == "getCurrentUsage") {
+                val prefs     = getSharedPreferences("AppLimiterPrefs", Context.MODE_PRIVATE)
+                val configStr = prefs.getString("limiterConfig", null)
+
+                if (configStr == null) {
+                    result.success(0)
+                    return@setMethodCallHandler
+                }
+
+                // Run on IO thread so we don't block the Flutter UI thread
+                CoroutineScope(Dispatchers.IO).launch {
+                    try {
+                        val config    = JSONObject(configStr)
+                        val appsArray = config.getJSONArray("packages")
+                        val targets   = mutableListOf<String>()
+                        for (i in 0 until appsArray.length()) targets.add(appsArray.getString(i))
+
+                        val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+
+                        // Window start = today @ configuredStartHour:configuredStartMinute
+                        val cal = Calendar.getInstance().apply {
+                            set(Calendar.HOUR_OF_DAY, config.getInt("startTimeHour"))
+                            set(Calendar.MINUTE,      config.getInt("startTimeMinute"))
+                            set(Calendar.SECOND,      0)
+                            set(Calendar.MILLISECOND, 0)
+                        }
+
+                        val statsMap = usm.queryAndAggregateUsageStats(
+                            cal.timeInMillis,
+                            System.currentTimeMillis()
+                        )
+
+                        var totalMs = 0L
+                        for (pkg in targets) {
+                            totalMs += statsMap[pkg]?.totalTimeInForeground ?: 0L
+                        }
+
+                        val totalMinutes = (totalMs / (1_000 * 60)).toInt()
+
+                        // Switch back to main thread to call result.success()
+                        withContext(Dispatchers.Main) {
+                            result.success(totalMinutes)
+                        }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) {
+                            result.error("USAGE_ERROR", e.message, null)
+                        }
+                    }
+                }
             }
             else {
                 result.notImplemented()
@@ -146,6 +203,7 @@ class MainActivity : FlutterActivity() {
             promptForUsageStats()
         }
     }
+
     private fun promptForUsageStats() {
         Log.d("UsageStatsCheck", "DENIED: promptForUsageStats() called.")
     }

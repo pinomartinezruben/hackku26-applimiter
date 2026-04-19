@@ -1,21 +1,24 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'dart:typed_data'; // Required for Uint8List (the byte array)
-import 'dart:convert';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:hackku_applimiter/limiter_list_page.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Data Models  (lightweight, no external packages)
+// Data Models
 // ─────────────────────────────────────────────────────────────────────────────
 
 enum LimiterModel { sharedHourly, perAppHourly, blockLimiter }
 
-class _AppEntry {
+/// One installed app — returned from Kotlin's getInstalledApps call.
+/// [icon] is a WebP-compressed Uint8List; null when running with stub data.
+class AppEntry {
   final String name;
   final String packageId;
-  final Uint8List? icon; // Added icon support
+  final Uint8List? icon;
   bool selected;
 
-  _AppEntry({
+  AppEntry({
     required this.name,
     required this.packageId,
     this.icon,
@@ -35,93 +38,193 @@ class NewLimiterPage extends StatefulWidget {
 }
 
 class _NewLimiterPageState extends State<NewLimiterPage> {
-  // ── Native Bridge & Dynamic App List ───────────────────────────────────────
-  final MethodChannel _channel = const MethodChannel('uniqueChannelName');
-  
-  List<_AppEntry> _allApps = [];
-  List<_AppEntry> _filteredApps = [];
-  bool _isLoading = true;
+  // ── Native bridge — same channel name everywhere, never duplicated ────────
+  static const _channel = MethodChannel('uniqueChannelName');
 
-  // Curated list of common social apps to show by default
-  final Set<String> _curatedSocialApps = {
-    'com.google.android.youtube',
-    'com.instagram.android',
-    'com.twitter.android',
-    'com.zhiliaoapp.musically', // TikTok
-    'com.facebook.katana',      // Facebook
-    'com.reddit.frontpage',
-    'com.snapchat.android',
-    'com.discord', // discord jaja
-  };
+  // ── App list ──────────────────────────────────────────────────────────────
+  List<AppEntry> _apps = [];
+  bool _appsLoading = true;
+  String _searchQuery = '';
+
+  // ── Timeframe ─────────────────────────────────────────────────────────────
+  TimeOfDay _startTime = const TimeOfDay(hour: 8,  minute: 0);
+  TimeOfDay _endTime   = const TimeOfDay(hour: 9,  minute: 0);
+
+  // ── Model selection ───────────────────────────────────────────────────────
+  LimiterModel _selectedModel = LimiterModel.sharedHourly;
+
+  int _sharedBudgetMinutes  = 5;
+  int _blockDurationMinutes = 30;
+  final Map<String, int> _perAppBudgets = {};
+
+  // ── Save guard ────────────────────────────────────────────────────────────
+  bool _saving = false;
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Lifecycle
+  // ─────────────────────────────────────────────────────────────────────────
 
   @override
   void initState() {
     super.initState();
-    _fetchInstalledApps();
+    _loadInstalledApps();
   }
 
-  Future<void> _fetchInstalledApps() async {
+  /// Invokes Kotlin's getInstalledApps and decodes the WebP icon bytes.
+  /// Falls back to a stub list if the channel is unavailable (simulator / debug).
+  Future<void> _loadInstalledApps() async {
     try {
-      final List<dynamic> result = await _channel.invokeMethod('getInstalledApps');
-      
-      final apps = result.map((item) {
-        final map = item as Map<Object?, Object?>;
-        return _AppEntry(
-          name: map['name'] as String? ?? 'Unknown App',
-          packageId: map['packageId'] as String? ?? '',
-          icon: map['icon'] as Uint8List?, // Extract the compressed WEBP array
+      final raw =
+          await _channel.invokeMethod<List<dynamic>>('getInstalledApps');
+      if (raw == null) throw Exception('null result');
+
+      final apps = raw.map((item) {
+        final m = Map<String, dynamic>.from(item as Map);
+        return AppEntry(
+          name:      m['name']      as String,
+          packageId: m['packageId'] as String,
+          icon:      m['icon']      as Uint8List?,
         );
       }).toList();
 
       setState(() {
-        _allApps = apps;
-        // Initially show only the curated apps (or apps you've manually selected)
-        _filteredApps = _allApps.where((app) => _curatedSocialApps.contains(app.packageId) || app.selected).toList();
-        _isLoading = false;
+        _apps = apps;
+        _appsLoading = false;
       });
-    } catch (e) {
+    } catch (_) {
+      // Graceful fallback so the UI renders during hot-reload / no device
       setState(() {
-        _isLoading = false;
+        _apps = [
+          AppEntry(name: 'YouTube',     packageId: 'com.google.android.youtube'),
+          AppEntry(name: 'TikTok',      packageId: 'com.zhiliaoapp.musically'),
+          AppEntry(name: 'Instagram',   packageId: 'com.instagram.android'),
+          AppEntry(name: 'Twitter / X', packageId: 'com.twitter.android'),
+          AppEntry(name: 'Reddit',      packageId: 'com.reddit.frontpage'),
+          AppEntry(name: 'Snapchat',    packageId: 'com.snapchat.android'),
+        ];
+        _appsLoading = false;
       });
     }
   }
 
-  void _onSearchChanged(String query) {
-    setState(() {
-      if (query.trim().isEmpty) {
-        // If search is cleared, revert to the clean curated list
-        _filteredApps = _allApps.where((app) => _curatedSocialApps.contains(app.packageId) || app.selected).toList();
-      } else {
-        // Filter against ALL apps when actively searching
-        _filteredApps = _allApps.where((app) {
-          return app.name.toLowerCase().contains(query.toLowerCase());
-        }).toList();
-      }
-    });
+  // ─────────────────────────────────────────────────────────────────────────
+  // _onSave  ← THE CORE OF THE INTEGRATION
+  // ─────────────────────────────────────────────────────────────────────────
+  //
+  //  Three things happen in strict sequence:
+  //
+  //  1. Build the canonical JSON blob the Kotlin engine reads.
+  //     Structure is exactly what LimiterService.kt expects:
+  //       {
+  //         "model":           "sharedHourly" | "perAppHourly" | "blockLimiter",
+  //         "startTimeHour":   8,
+  //         "startTimeMinute": 0,
+  //         "endTimeHour":     9,
+  //         "endTimeMinute":   0,
+  //         "sharedBudget":    5,          // minutes; used by sharedHourly & blockLimiter
+  //         "perAppBudgets":   {"com.x": 10, ...}, // used by perAppHourly
+  //         "packages":        ["com.x", ...]
+  //       }
+  //
+  //  2. Persist in Dart-side SharedPreferences (key: "limiterConfig").
+  //     This lets LimiterListPage reload the config after a cold app restart
+  //     without going back through the MethodChannel.
+  //
+  //  3. Push the same string over the MethodChannel as "saveLimiterConfig".
+  //     Kotlin saves it to *native* SharedPreferences AND immediately calls
+  //     startForegroundService() to boot LimiterService. LimiterService reads
+  //     directly from the native SharedPreferences file — it never touches Dart.
+  //
+  //  Then navigate to LimiterListPage, passing the JSON so the page can render
+  //  the active profile immediately with zero additional I/O.
+
+  Future<void> _onSave() async {
+    final selected = _apps.where((a) => a.selected).toList();
+
+    if (selected.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Select at least one app to limit.'),
+          backgroundColor: Color(0xFFFF4D4D),
+        ),
+      );
+      return;
+    }
+
+    setState(() => _saving = true);
+
+    // ── 1. Canonical JSON payload ─────────────────────────────────────────
+    final int effectiveBudget;
+    switch (_selectedModel) {
+      case LimiterModel.sharedHourly:
+        effectiveBudget = _sharedBudgetMinutes;
+      case LimiterModel.blockLimiter:
+        effectiveBudget = _blockDurationMinutes;
+      case LimiterModel.perAppHourly:
+        effectiveBudget = 0; // unused; perAppBudgets map is the authority
+    }
+
+    final Map<String, dynamic> config = {
+      'model':           _modelKey(_selectedModel),
+      'startTimeHour':   _startTime.hour,
+      'startTimeMinute': _startTime.minute,
+      'endTimeHour':     _endTime.hour,
+      'endTimeMinute':   _endTime.minute,
+      'sharedBudget':    effectiveBudget,
+      'perAppBudgets': {
+        for (final app in selected)
+          app.packageId: _perAppBudgets[app.packageId] ?? 10,
+      },
+      'packages': selected.map((a) => a.packageId).toList(),
+    };
+
+    final String jsonString = jsonEncode(config);
+
+    try {
+      // ── 2. Dart-side persistence ──────────────────────────────────────
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('limiterConfig', jsonString);
+
+      // ── 3. Kotlin bridge: save natively + boot LimiterService ─────────
+      // The map key 'config' matches what Kotlin reads via call.argument("config")
+      await _channel.invokeMethod('saveLimiterConfig', {'config': jsonString});
+
+      if (!mounted) return;
+
+      // ── Navigate, pass JSON so the list screen doesn't need another read
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(
+          builder: (_) => LimiterListPage(initialConfigJson: jsonString),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Save failed: $e'),
+          backgroundColor: const Color(0xFFFF4D4D),
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
   }
 
-  // ── Timeframe ──────────────────────────────────────────────────────────────
-  TimeOfDay _startTime = const TimeOfDay(hour: 15, minute: 0); // 3:00 PM
-  TimeOfDay _endTime   = const TimeOfDay(hour: 19, minute: 0); // 7:00 PM
+  String _modelKey(LimiterModel m) => switch (m) {
+        LimiterModel.sharedHourly  => 'sharedHourly',
+        LimiterModel.perAppHourly  => 'perAppHourly',
+        LimiterModel.blockLimiter  => 'blockLimiter',
+      };
 
-  // ── Limiting model ─────────────────────────────────────────────────────────
-  LimiterModel _selectedModel = LimiterModel.sharedHourly;
+  // ─────────────────────────────────────────────────────────────────────────
+  // UI helpers
+  // ─────────────────────────────────────────────────────────────────────────
 
-  // Shared hourly – single global budget (minutes)
-  int _sharedBudgetMinutes = 15;
-
-  // Per-app hourly – each selected app gets its own budget (minutes)
-  final Map<String, int> _perAppBudgets = {};
-
-  // Block limiter – one fixed duration (minutes)
-  int _blockDurationMinutes = 30;
-
-  // ── Helpers ────────────────────────────────────────────────────────────────
-  String _formatTime(TimeOfDay t) {
-    final hour   = t.hourOfPeriod == 0 ? 12 : t.hourOfPeriod;
-    final minute = t.minute.toString().padLeft(2, '0');
-    final period = t.period == DayPeriod.am ? 'AM' : 'PM';
-    return '$hour:$minute $period';
+  String _fmt(TimeOfDay t) {
+    final h = t.hourOfPeriod == 0 ? 12 : t.hourOfPeriod;
+    final m = t.minute.toString().padLeft(2, '0');
+    return '$h:$m ${t.period == DayPeriod.am ? 'AM' : 'PM'}';
   }
 
   Future<void> _pickTime({required bool isStart}) async {
@@ -140,147 +243,79 @@ class _NewLimiterPageState extends State<NewLimiterPage> {
       ),
     );
     if (picked == null) return;
-    setState(() {
-      if (isStart) {
-        _startTime = picked;
-      } else {
-        _endTime = picked;
-      }
-    });
+    setState(() => isStart ? _startTime = picked : _endTime = picked);
   }
 
-  List<_AppEntry> get _selectedApps =>
-      _allApps.where((a) => a.selected).toList();
-
-  void _onSave() async {
-      if (_selectedApps.isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Please select at least one app.')),
-        );
-        return;
-      }
-
-      // 1. Build the Configuration Payload
-      final config = {
-        'model': _selectedModel.name, // e.g., "sharedHourly"
-        'sharedBudget': _sharedBudgetMinutes,
-        'pin': '0000', // Hardcoded as requested
-        'packages': _selectedApps.map((a) => a.packageId).toList(),
-      };
-
-      final jsonString = jsonEncode(config);
-
-      // 2. Fire it over the bridge to start the Kotlin service
-      try {
-        await _channel.invokeMethod('saveLimiterConfig', jsonString);
-        
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('Limiter Active! Monitoring ${_selectedApps.length} apps.'),
-              backgroundColor: const Color(0xFF00B686),
-            ),
-          );
-          Navigator.pop(context);
-        }
-      } catch (e) {
-        debugPrint("Failed to start native service: $e");
-      }
-    }
-
-  // ── Section header ─────────────────────────────────────────────────────────
-  Widget _sectionHeader(String title) => Padding(
+  Widget _sectionHeader(String t) => Padding(
         padding: const EdgeInsets.only(top: 28, bottom: 10),
-        child: Text(
-          title,
-          style: const TextStyle(
-            color: Color(0xFF3D5AFE),
-            fontSize: 13,
-            fontWeight: FontWeight.w700,
-            letterSpacing: 1.3,
-          ),
-        ),
+        child: Text(t,
+            style: const TextStyle(
+                color: Color(0xFF3D5AFE),
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 1.4)),
       );
 
-  // ── Time picker tile ───────────────────────────────────────────────────────
   Widget _timeTile(String label, TimeOfDay time, VoidCallback onTap) =>
       GestureDetector(
         onTap: onTap,
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
           decoration: BoxDecoration(
-            color: const Color(0xFF1A1D35),
-            borderRadius: BorderRadius.circular(12),
-          ),
-          child: Row(
-            children: [
-              const Icon(Icons.access_time, color: Color(0xFF3D5AFE), size: 20),
-              const SizedBox(width: 12),
-              Text(
-                label,
+              color: const Color(0xFF1A1D35),
+              borderRadius: BorderRadius.circular(12)),
+          child: Row(children: [
+            const Icon(Icons.access_time, color: Color(0xFF3D5AFE), size: 20),
+            const SizedBox(width: 12),
+            Text(label,
                 style: TextStyle(
-                  color: Colors.white.withOpacity(0.6),
-                  fontSize: 14,
-                ),
-              ),
-              const Spacer(),
-              Text(
-                _formatTime(time),
+                    color: Colors.white.withOpacity(0.6), fontSize: 14)),
+            const Spacer(),
+            Text(_fmt(time),
                 style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ],
-          ),
+                    color: Colors.white,
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600)),
+          ]),
         ),
       );
 
-  // ── Budget stepper ─────────────────────────────────────────────────────────
-  Widget _minuteStepper({
+  Widget _stepper({
     required String label,
     required int value,
     required ValueChanged<int> onChange,
   }) =>
-      Row(
-        children: [
-          Expanded(
-            child: Text(
-              label,
-              style: const TextStyle(color: Colors.white70, fontSize: 14),
-            ),
-          ),
-          IconButton(
-            icon: const Icon(Icons.remove_circle_outline, color: Color(0xFF3D5AFE)),
-            onPressed: () => onChange((value - 5).clamp(5, 120)),
-          ),
-          SizedBox(
-            width: 44,
-            child: Text(
-              '$value m',
+      Row(children: [
+        Expanded(
+            child: Text(label,
+                style:
+                    const TextStyle(color: Colors.white70, fontSize: 14))),
+        IconButton(
+          icon: const Icon(Icons.remove_circle_outline,
+              color: Color(0xFF3D5AFE)),
+          onPressed: () => onChange((value - 5).clamp(1, 120)),
+        ),
+        SizedBox(
+          width: 44,
+          child: Text('$value m',
               textAlign: TextAlign.center,
               style: const TextStyle(
-                color: Colors.white,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-          ),
-          IconButton(
-            icon: const Icon(Icons.add_circle_outline, color: Color(0xFF3D5AFE)),
-            onPressed: () => onChange((value + 5).clamp(5, 120)),
-          ),
-        ],
-      );
+                  color: Colors.white, fontWeight: FontWeight.bold)),
+        ),
+        IconButton(
+          icon:
+              const Icon(Icons.add_circle_outline, color: Color(0xFF3D5AFE)),
+          onPressed: () => onChange((value + 5).clamp(1, 120)),
+        ),
+      ]);
 
-  // ── Model card ─────────────────────────────────────────────────────────────
   Widget _modelCard({
     required LimiterModel model,
     required String title,
     required String subtitle,
     required IconData icon,
   }) {
-    final selected = _selectedModel == model;
+    final sel = _selectedModel == model;
     return GestureDetector(
       onTap: () => setState(() => _selectedModel = model),
       child: AnimatedContainer(
@@ -288,55 +323,59 @@ class _NewLimiterPageState extends State<NewLimiterPage> {
         margin: const EdgeInsets.only(bottom: 10),
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
         decoration: BoxDecoration(
-          color: selected
-              ? const Color(0xFF3D5AFE).withOpacity(0.18)
+          color: sel
+              ? const Color(0xFF3D5AFE).withOpacity(0.15)
               : const Color(0xFF1A1D35),
           border: Border.all(
-            color: selected ? const Color(0xFF3D5AFE) : Colors.transparent,
-            width: 1.5,
-          ),
+              color: sel ? const Color(0xFF3D5AFE) : Colors.transparent,
+              width: 1.5),
           borderRadius: BorderRadius.circular(12),
         ),
-        child: Row(
-          children: [
-            Icon(icon,
-                color: selected
-                    ? const Color(0xFF3D5AFE)
-                    : Colors.white.withOpacity(0.4),
-                size: 26),
-            const SizedBox(width: 14),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    title,
+        child: Row(children: [
+          Icon(icon,
+              color: sel
+                  ? const Color(0xFF3D5AFE)
+                  : Colors.white.withOpacity(0.35),
+              size: 26),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(title,
                     style: TextStyle(
-                      color: selected ? Colors.white : Colors.white70,
-                      fontWeight: FontWeight.w600,
-                      fontSize: 15,
-                    ),
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    subtitle,
+                        color: sel ? Colors.white : Colors.white70,
+                        fontWeight: FontWeight.w600,
+                        fontSize: 15)),
+                const SizedBox(height: 2),
+                Text(subtitle,
                     style: TextStyle(
-                      color: Colors.white.withOpacity(0.4),
-                      fontSize: 12,
-                    ),
-                  ),
-                ],
-              ),
+                        color: Colors.white.withOpacity(0.38),
+                        fontSize: 12)),
+              ],
             ),
-            if (selected)
-              const Icon(Icons.check_circle, color: Color(0xFF3D5AFE), size: 20),
-          ],
-        ),
+          ),
+          if (sel)
+            const Icon(Icons.check_circle,
+                color: Color(0xFF3D5AFE), size: 20),
+        ]),
       ),
     );
   }
 
-  // ── Build ──────────────────────────────────────────────────────────────────
+  List<AppEntry> get _filtered => _searchQuery.isEmpty
+      ? _apps
+      : _apps
+          .where((a) =>
+              a.name.toLowerCase().contains(_searchQuery.toLowerCase()))
+          .toList();
+
+  List<AppEntry> get _selectedApps => _apps.where((a) => a.selected).toList();
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Build
+  // ─────────────────────────────────────────────────────────────────────────
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -344,218 +383,215 @@ class _NewLimiterPageState extends State<NewLimiterPage> {
       appBar: AppBar(
         backgroundColor: const Color(0xFF1A1D35),
         leading: const BackButton(color: Colors.white),
-        title: const Text(
-          'New Limiter',
-          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-        ),
+        title: const Text('New Limiter',
+            style: TextStyle(
+                color: Colors.white, fontWeight: FontWeight.bold)),
         centerTitle: true,
         elevation: 0,
       ),
-      body: ListView(
-        padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 12),
-        children: [
-          // ── 1. App Selection ────────────────────────────────────────────────
-          _sectionHeader('SELECT APPS'),
-          
-          // Search Bar
-          Container(
-            margin: const EdgeInsets.only(bottom: 12),
-            decoration: BoxDecoration(
-              color: const Color(0xFF1A1D35),
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: TextField(
-              style: const TextStyle(color: Colors.white),
-              decoration: InputDecoration(
-                hintText: 'Search apps...',
-                hintStyle: TextStyle(color: Colors.white.withOpacity(0.4)),
-                prefixIcon: const Icon(Icons.search, color: Color(0xFF3D5AFE)),
-                border: InputBorder.none,
-                contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-              ),
-              onChanged: _onSearchChanged,
-            ),
-          ),
-
-          // Dynamic App List
-          Container(
-            decoration: BoxDecoration(
-              color: const Color(0xFF1A1D35),
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: _isLoading 
-                ? const Padding(
-                    padding: EdgeInsets.all(32.0),
-                    child: Center(
-                      child: CircularProgressIndicator(color: Color(0xFF3D5AFE)),
+      body: _appsLoading
+          ? const Center(
+              child:
+                  CircularProgressIndicator(color: Color(0xFF3D5AFE)))
+          : ListView(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 22, vertical: 12),
+              children: [
+                // ── SELECT APPS ────────────────────────────────────────────
+                _sectionHeader('SELECT APPS'),
+                Container(
+                  margin: const EdgeInsets.only(bottom: 10),
+                  decoration: BoxDecoration(
+                      color: const Color(0xFF1A1D35),
+                      borderRadius: BorderRadius.circular(10)),
+                  child: TextField(
+                    style: const TextStyle(color: Colors.white),
+                    decoration: InputDecoration(
+                      hintText: 'Search apps…',
+                      hintStyle: TextStyle(
+                          color: Colors.white.withOpacity(0.35)),
+                      prefixIcon: Icon(Icons.search,
+                          color: Colors.white.withOpacity(0.35)),
+                      border: InputBorder.none,
+                      contentPadding:
+                          const EdgeInsets.symmetric(vertical: 14),
                     ),
-                  )
-                : _filteredApps.isEmpty
-                    ? Padding(
-                        padding: const EdgeInsets.all(32.0),
-                        child: Center(
-                          child: Text(
-                            'No apps found.',
-                            style: TextStyle(color: Colors.white.withOpacity(0.4)),
-                          ),
-                        ),
-                      )
-                    : Column(
-                        children: _filteredApps.map((app) {
-                          return CheckboxListTile(
-                            // Display the loaded icon dynamically
-                            secondary: app.icon != null 
-                              ? ClipRRect(
-                                  borderRadius: BorderRadius.circular(8),
-                                  child: Image.memory(
-                                    app.icon!,
+                    onChanged: (v) =>
+                        setState(() => _searchQuery = v),
+                  ),
+                ),
+                Container(
+                  decoration: BoxDecoration(
+                      color: const Color(0xFF1A1D35),
+                      borderRadius: BorderRadius.circular(12)),
+                  child: Column(
+                    children: _filtered.map((app) {
+                      return CheckboxListTile(
+                        secondary: app.icon != null
+                            ? ClipRRect(
+                                borderRadius: BorderRadius.circular(8),
+                                child: Image.memory(app.icon!,
                                     width: 36,
                                     height: 36,
-                                    fit: BoxFit.cover,
-                                  ),
-                                )
-                              : const Icon(Icons.android, color: Colors.white54, size: 36),
-                            title: Text(
-                              app.name,
-                              style: const TextStyle(color: Colors.white, fontSize: 15),
-                            ),
-                            // Removed the packageId subtitle requirement here
-                            value: app.selected,
-                            activeColor: const Color(0xFF3D5AFE),
-                            checkColor: Colors.white,
-                            side: BorderSide(color: Colors.white.withOpacity(0.25)),
-                            onChanged: (v) =>
-                                setState(() => app.selected = v ?? false),
-                          );
-                        }).toList(),
-                      ),
-          ),
+                                    fit: BoxFit.cover),
+                              )
+                            : Container(
+                                width: 36,
+                                height: 36,
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF3D5AFE)
+                                      .withOpacity(0.2),
+                                  borderRadius:
+                                      BorderRadius.circular(8),
+                                ),
+                                child: const Icon(Icons.android,
+                                    color: Color(0xFF3D5AFE),
+                                    size: 20),
+                              ),
+                        title: Text(app.name,
+                            style: const TextStyle(
+                                color: Colors.white, fontSize: 15)),
+                        subtitle: Text(app.packageId,
+                            style: TextStyle(
+                                color: Colors.white.withOpacity(0.3),
+                                fontSize: 11)),
+                        value: app.selected,
+                        activeColor: const Color(0xFF3D5AFE),
+                        checkColor: Colors.white,
+                        side: BorderSide(
+                            color: Colors.white.withOpacity(0.2)),
+                        onChanged: (v) =>
+                            setState(() => app.selected = v ?? false),
+                      );
+                    }).toList(),
+                  ),
+                ),
 
-          // ── 2. Active Timeframe ─────────────────────────────────────────────
-          _sectionHeader('ACTIVE TIMEFRAME'),
-          _timeTile(
-            'Start time',
-            _startTime,
-            () => _pickTime(isStart: true),
-          ),
-          const SizedBox(height: 10),
-          _timeTile(
-            'End time',
-            _endTime,
-            () => _pickTime(isStart: false),
-          ),
+                // ── TIMEFRAME ──────────────────────────────────────────────
+                _sectionHeader('ACTIVE TIMEFRAME'),
+                _timeTile('Start time', _startTime,
+                    () => _pickTime(isStart: true)),
+                const SizedBox(height: 10),
+                _timeTile('End time', _endTime,
+                    () => _pickTime(isStart: false)),
 
-          // ── 3. Limiting Model ───────────────────────────────────────────────
-          _sectionHeader('LIMITING MODEL'),
-          _modelCard(
-            model: LimiterModel.sharedHourly,
-            icon: Icons.pie_chart_outline_rounded,
-            title: 'A · Shared Hourly Cycle',
-            subtitle: 'All selected apps draw from one shared time budget.',
-          ),
-          _modelCard(
-            model: LimiterModel.perAppHourly,
-            icon: Icons.apps_rounded,
-            title: 'B · Per-App Hourly Cycle',
-            subtitle: 'Each app has its own independent time budget.',
-          ),
-          _modelCard(
-            model: LimiterModel.blockLimiter,
-            icon: Icons.timer_outlined,
-            title: 'C · Block Limiter',
-            subtitle: 'A single fixed timer for a continuous usage block.',
-          ),
+                // ── MODEL ──────────────────────────────────────────────────
+                _sectionHeader('LIMITING MODEL'),
+                _modelCard(
+                  model: LimiterModel.sharedHourly,
+                  icon: Icons.pie_chart_outline_rounded,
+                  title: 'A · Shared Hourly Cycle',
+                  subtitle:
+                      'All apps draw from one shared pool per hour.',
+                ),
+                _modelCard(
+                  model: LimiterModel.perAppHourly,
+                  icon: Icons.apps_rounded,
+                  title: 'B · Per-App Hourly Cycle',
+                  subtitle:
+                      'Each app has its own independent limit per hour.',
+                ),
+                _modelCard(
+                  model: LimiterModel.blockLimiter,
+                  icon: Icons.timer_outlined,
+                  title: 'C · Block Limiter',
+                  subtitle:
+                      'One fixed timer for a continuous usage session.',
+                ),
 
-          // ── 4. Model-specific config ────────────────────────────────────────
-          if (_selectedModel == LimiterModel.sharedHourly) ...[
-            _sectionHeader('SHARED BUDGET'),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-              decoration: BoxDecoration(
-                color: const Color(0xFF1A1D35),
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: _minuteStepper(
-                label: 'Minutes allowed per hour (total)',
-                value: _sharedBudgetMinutes,
-                onChange: (v) => setState(() => _sharedBudgetMinutes = v),
-              ),
+                // ── MODEL CONFIG ───────────────────────────────────────────
+                if (_selectedModel == LimiterModel.sharedHourly) ...[
+                  _sectionHeader('SHARED BUDGET'),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 14, vertical: 8),
+                    decoration: BoxDecoration(
+                        color: const Color(0xFF1A1D35),
+                        borderRadius: BorderRadius.circular(12)),
+                    child: _stepper(
+                      label: 'Minutes allowed per hour (shared pool)',
+                      value: _sharedBudgetMinutes,
+                      onChange: (v) =>
+                          setState(() => _sharedBudgetMinutes = v),
+                    ),
+                  ),
+                ],
+                if (_selectedModel == LimiterModel.perAppHourly) ...[
+                  _sectionHeader('PER-APP BUDGETS'),
+                  _selectedApps.isEmpty
+                      ? Text(
+                          'Select apps above to set individual limits.',
+                          style: TextStyle(
+                              color: Colors.white.withOpacity(0.4),
+                              fontSize: 13,
+                              fontStyle: FontStyle.italic),
+                        )
+                      : Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 14, vertical: 8),
+                          decoration: BoxDecoration(
+                              color: const Color(0xFF1A1D35),
+                              borderRadius: BorderRadius.circular(12)),
+                          child: Column(
+                            children: _selectedApps.map((app) {
+                              final b =
+                                  _perAppBudgets[app.packageId] ?? 10;
+                              return _stepper(
+                                label: app.name,
+                                value: b,
+                                onChange: (v) => setState(() =>
+                                    _perAppBudgets[app.packageId] = v),
+                              );
+                            }).toList(),
+                          ),
+                        ),
+                ],
+                if (_selectedModel == LimiterModel.blockLimiter) ...[
+                  _sectionHeader('BLOCK DURATION'),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 14, vertical: 8),
+                    decoration: BoxDecoration(
+                        color: const Color(0xFF1A1D35),
+                        borderRadius: BorderRadius.circular(12)),
+                    child: _stepper(
+                      label: 'Total session minutes',
+                      value: _blockDurationMinutes,
+                      onChange: (v) =>
+                          setState(() => _blockDurationMinutes = v),
+                    ),
+                  ),
+                ],
+
+                const SizedBox(height: 36),
+                SizedBox(
+                  height: 58,
+                  child: ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF3D5AFE),
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14)),
+                      elevation: 4,
+                    ),
+                    icon: _saving
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(
+                                color: Colors.white, strokeWidth: 2))
+                        : const Icon(Icons.save_rounded),
+                    label: Text(
+                      _saving ? 'Saving…' : 'Save Limiter',
+                      style: const TextStyle(
+                          fontSize: 17, fontWeight: FontWeight.w700),
+                    ),
+                    onPressed: _saving ? null : _onSave,
+                  ),
+                ),
+                const SizedBox(height: 32),
+              ],
             ),
-          ],
-
-          if (_selectedModel == LimiterModel.perAppHourly) ...[
-            _sectionHeader('PER-APP BUDGETS'),
-            if (_selectedApps.isEmpty)
-              Text(
-                'Select at least one app above to configure per-app limits.',
-                style: TextStyle(
-                  color: Colors.white.withOpacity(0.4),
-                  fontSize: 13,
-                  fontStyle: FontStyle.italic,
-                ),
-              )
-            else
-              Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF1A1D35),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Column(
-                  children: _selectedApps.map((app) {
-                    final budget = _perAppBudgets[app.packageId] ?? 10;
-                    return _minuteStepper(
-                      label: app.name,
-                      value: budget,
-                      onChange: (v) => setState(
-                          () => _perAppBudgets[app.packageId] = v),
-                    );
-                  }).toList(),
-                ),
-              ),
-          ],
-
-          if (_selectedModel == LimiterModel.blockLimiter) ...[
-            _sectionHeader('BLOCK DURATION'),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-              decoration: BoxDecoration(
-                color: const Color(0xFF1A1D35),
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: _minuteStepper(
-                label: 'Total minutes for the block',
-                value: _blockDurationMinutes,
-                onChange: (v) => setState(() => _blockDurationMinutes = v),
-              ),
-            ),
-          ],
-
-          // ── Save ────────────────────────────────────────────────────────────
-          const SizedBox(height: 36),
-          SizedBox(
-            height: 58,
-            child: ElevatedButton.icon(
-              style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFF3D5AFE),
-                foregroundColor: Colors.white,
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(14),
-                ),
-                elevation: 4,
-              ),
-              icon: const Icon(Icons.save_rounded),
-              label: const Text(
-                'Save Limiter',
-                style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700),
-              ),
-              onPressed: _onSave,
-            ),
-          ),
-          const SizedBox(height: 32),
-        ],
-      ),
     );
   }
 }
