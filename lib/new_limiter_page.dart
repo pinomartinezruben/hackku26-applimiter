@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart'; // Required for MethodChannel
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Data Models  (lightweight, no external packages)
@@ -30,15 +31,52 @@ class NewLimiterPage extends StatefulWidget {
 }
 
 class _NewLimiterPageState extends State<NewLimiterPage> {
-  // ── Stub app list (replace with real package query via MethodChannel later) ──
-  final List<_AppEntry> _apps = [
-    _AppEntry(name: 'YouTube',   packageId: 'com.google.android.youtube'),
-    _AppEntry(name: 'Instagram', packageId: 'com.instagram.android'),
-    _AppEntry(name: 'Twitter / X', packageId: 'com.twitter.android'),
-    _AppEntry(name: 'TikTok',    packageId: 'com.zhiliaoapp.musically'),
-    _AppEntry(name: 'Reddit',    packageId: 'com.reddit.frontpage'),
-    _AppEntry(name: 'Snapchat',  packageId: 'com.snapchat.android'),
-  ];
+  // ── Native Bridge & Dynamic App List ───────────────────────────────────────
+  final MethodChannel _channel = const MethodChannel('uniqueChannelName');
+  
+  List<_AppEntry> _allApps = [];
+  List<_AppEntry> _filteredApps = [];
+  bool _isLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _fetchInstalledApps();
+  }
+
+  Future<void> _fetchInstalledApps() async {
+    try {
+      final List<dynamic> result = await _channel.invokeMethod('getInstalledApps');
+      
+      final apps = result.map((item) {
+        // Cast the returned map securely
+        final map = item as Map<Object?, Object?>;
+        return _AppEntry(
+          name: map['name'] as String? ?? 'Unknown App',
+          packageId: map['packageId'] as String? ?? 'unknown.package',
+        );
+      }).toList();
+
+      setState(() {
+        _allApps = apps;
+        _filteredApps = apps;
+        _isLoading = false;
+      });
+    } catch (e) {
+      // Fallback in case of platform error
+      setState(() {
+        _isLoading = false;
+      });
+    }
+  }
+
+  void _onSearchChanged(String query) {
+    setState(() {
+      _filteredApps = _allApps.where((app) {
+        return app.name.toLowerCase().contains(query.toLowerCase());
+      }).toList();
+    });
+  }
 
   // ── Timeframe ──────────────────────────────────────────────────────────────
   TimeOfDay _startTime = const TimeOfDay(hour: 15, minute: 0); // 3:00 PM
@@ -89,8 +127,9 @@ class _NewLimiterPageState extends State<NewLimiterPage> {
     });
   }
 
+  // Updated to read from _allApps instead of hardcoded _apps
   List<_AppEntry> get _selectedApps =>
-      _apps.where((a) => a.selected).toList();
+      _allApps.where((a) => a.selected).toList();
 
   void _onSave() {
     // TODO: Serialize and persist the limiter profile (Kotlin bridge / shared_prefs)
@@ -273,34 +312,73 @@ class _NewLimiterPageState extends State<NewLimiterPage> {
         children: [
           // ── 1. App Selection ────────────────────────────────────────────────
           _sectionHeader('SELECT APPS'),
+          
+          // Search Bar
+          Container(
+            margin: const EdgeInsets.only(bottom: 12),
+            decoration: BoxDecoration(
+              color: const Color(0xFF1A1D35),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: TextField(
+              style: const TextStyle(color: Colors.white),
+              decoration: InputDecoration(
+                hintText: 'Search apps...',
+                hintStyle: TextStyle(color: Colors.white.withOpacity(0.4)),
+                prefixIcon: const Icon(Icons.search, color: Color(0xFF3D5AFE)),
+                border: InputBorder.none,
+                contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+              ),
+              onChanged: _onSearchChanged,
+            ),
+          ),
+
+          // Dynamic App List
           Container(
             decoration: BoxDecoration(
               color: const Color(0xFF1A1D35),
               borderRadius: BorderRadius.circular(12),
             ),
-            child: Column(
-              children: _apps.map((app) {
-                return CheckboxListTile(
-                  title: Text(
-                    app.name,
-                    style: const TextStyle(color: Colors.white, fontSize: 15),
-                  ),
-                  subtitle: Text(
-                    app.packageId,
-                    style: TextStyle(
-                      color: Colors.white.withOpacity(0.35),
-                      fontSize: 11,
+            child: _isLoading 
+                ? const Padding(
+                    padding: EdgeInsets.all(32.0),
+                    child: Center(
+                      child: CircularProgressIndicator(color: Color(0xFF3D5AFE)),
                     ),
-                  ),
-                  value: app.selected,
-                  activeColor: const Color(0xFF3D5AFE),
-                  checkColor: Colors.white,
-                  side: BorderSide(color: Colors.white.withOpacity(0.25)),
-                  onChanged: (v) =>
-                      setState(() => app.selected = v ?? false),
-                );
-              }).toList(),
-            ),
+                  )
+                : _filteredApps.isEmpty
+                    ? Padding(
+                        padding: const EdgeInsets.all(32.0),
+                        child: Center(
+                          child: Text(
+                            'No apps found.',
+                            style: TextStyle(color: Colors.white.withOpacity(0.4)),
+                          ),
+                        ),
+                      )
+                    : Column(
+                        children: _filteredApps.map((app) {
+                          return CheckboxListTile(
+                            title: Text(
+                              app.name,
+                              style: const TextStyle(color: Colors.white, fontSize: 15),
+                            ),
+                            subtitle: Text(
+                              app.packageId,
+                              style: TextStyle(
+                                color: Colors.white.withOpacity(0.35),
+                                fontSize: 11,
+                              ),
+                            ),
+                            value: app.selected,
+                            activeColor: const Color(0xFF3D5AFE),
+                            checkColor: Colors.white,
+                            side: BorderSide(color: Colors.white.withOpacity(0.25)),
+                            onChanged: (v) =>
+                                setState(() => app.selected = v ?? false),
+                          );
+                        }).toList(),
+                      ),
           ),
 
           // ── 2. Active Timeframe ─────────────────────────────────────────────
