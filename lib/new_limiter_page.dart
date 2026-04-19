@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart'; // Required for MethodChannel
+import 'package:flutter/services.dart';
+import 'dart:typed_data'; // Required for Uint8List (the byte array)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Data Models  (lightweight, no external packages)
@@ -10,11 +11,13 @@ enum LimiterModel { sharedHourly, perAppHourly, blockLimiter }
 class _AppEntry {
   final String name;
   final String packageId;
+  final Uint8List? icon; // Added icon support
   bool selected;
 
   _AppEntry({
     required this.name,
     required this.packageId,
+    this.icon,
     this.selected = false,
   });
 }
@@ -38,6 +41,18 @@ class _NewLimiterPageState extends State<NewLimiterPage> {
   List<_AppEntry> _filteredApps = [];
   bool _isLoading = true;
 
+  // Curated list of common social apps to show by default
+  final Set<String> _curatedSocialApps = {
+    'com.google.android.youtube',
+    'com.instagram.android',
+    'com.twitter.android',
+    'com.zhiliaoapp.musically', // TikTok
+    'com.facebook.katana',      // Facebook
+    'com.reddit.frontpage',
+    'com.snapchat.android',
+    'com.discord', // discord jaja
+  };
+
   @override
   void initState() {
     super.initState();
@@ -49,21 +64,21 @@ class _NewLimiterPageState extends State<NewLimiterPage> {
       final List<dynamic> result = await _channel.invokeMethod('getInstalledApps');
       
       final apps = result.map((item) {
-        // Cast the returned map securely
         final map = item as Map<Object?, Object?>;
         return _AppEntry(
           name: map['name'] as String? ?? 'Unknown App',
-          packageId: map['packageId'] as String? ?? 'unknown.package',
+          packageId: map['packageId'] as String? ?? '',
+          icon: map['icon'] as Uint8List?, // Extract the compressed WEBP array
         );
       }).toList();
 
       setState(() {
         _allApps = apps;
-        _filteredApps = apps;
+        // Initially show only the curated apps (or apps you've manually selected)
+        _filteredApps = _allApps.where((app) => _curatedSocialApps.contains(app.packageId) || app.selected).toList();
         _isLoading = false;
       });
     } catch (e) {
-      // Fallback in case of platform error
       setState(() {
         _isLoading = false;
       });
@@ -72,9 +87,15 @@ class _NewLimiterPageState extends State<NewLimiterPage> {
 
   void _onSearchChanged(String query) {
     setState(() {
-      _filteredApps = _allApps.where((app) {
-        return app.name.toLowerCase().contains(query.toLowerCase());
-      }).toList();
+      if (query.trim().isEmpty) {
+        // If search is cleared, revert to the clean curated list
+        _filteredApps = _allApps.where((app) => _curatedSocialApps.contains(app.packageId) || app.selected).toList();
+      } else {
+        // Filter against ALL apps when actively searching
+        _filteredApps = _allApps.where((app) {
+          return app.name.toLowerCase().contains(query.toLowerCase());
+        }).toList();
+      }
     });
   }
 
@@ -127,12 +148,10 @@ class _NewLimiterPageState extends State<NewLimiterPage> {
     });
   }
 
-  // Updated to read from _allApps instead of hardcoded _apps
   List<_AppEntry> get _selectedApps =>
       _allApps.where((a) => a.selected).toList();
 
   void _onSave() {
-    // TODO: Serialize and persist the limiter profile (Kotlin bridge / shared_prefs)
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(
@@ -359,17 +378,23 @@ class _NewLimiterPageState extends State<NewLimiterPage> {
                     : Column(
                         children: _filteredApps.map((app) {
                           return CheckboxListTile(
+                            // Display the loaded icon dynamically
+                            secondary: app.icon != null 
+                              ? ClipRRect(
+                                  borderRadius: BorderRadius.circular(8),
+                                  child: Image.memory(
+                                    app.icon!,
+                                    width: 36,
+                                    height: 36,
+                                    fit: BoxFit.cover,
+                                  ),
+                                )
+                              : const Icon(Icons.android, color: Colors.white54, size: 36),
                             title: Text(
                               app.name,
                               style: const TextStyle(color: Colors.white, fontSize: 15),
                             ),
-                            subtitle: Text(
-                              app.packageId,
-                              style: TextStyle(
-                                color: Colors.white.withOpacity(0.35),
-                                fontSize: 11,
-                              ),
-                            ),
+                            // Removed the packageId subtitle requirement here
                             value: app.selected,
                             activeColor: const Color(0xFF3D5AFE),
                             checkColor: Colors.white,
