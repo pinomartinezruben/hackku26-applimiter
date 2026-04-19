@@ -41,7 +41,7 @@ class MainActivity : FlutterActivity() {
     // functions for implemention app list
     private fun getVisibleApps(): List<Map<String, String>> {
         val pm = context.packageManager
-        val apps = pm.getInstallApplications(PackageManager.GET_META_DATA)
+        val apps = pm.getInstalledApplications(PackageManager.GET_META_DATA)
         val appList = ArrayList<Map<String, String>>()
 
         for (appInfo in apps) {
@@ -49,7 +49,7 @@ class MainActivity : FlutterActivity() {
                 val appMap = HashMap <String, String>()
                 appMap["name"] = appInfo.loadLabel(pm).toString()
                 appMap["packageId"] = appInfo.packageName
-                appList.add(addMap)
+                appList.add(appMap)
             }
         }
         return appList.sortedBy {it["name"]?.lowercase()}
