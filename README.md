@@ -2589,6 +2589,26 @@ class _NewLimiterPageState extends State<NewLimiterPage> {
 }
 ```
 
+adding these in the xml stuff:
+
+```
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <service
+        android:name=".LimiterService"
+        android:foregroundServiceType="specialUse"
+        android:exported="false" />
+
+    <activity
+        android:name=".BlockActivity"
+        android:exported="false"
+        android:launchMode="singleInstance"
+        android:theme="@style/LaunchTheme" />
+```
+
+
+
 
 ## Layout
 App design jargon yatta yatta

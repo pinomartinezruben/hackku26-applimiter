@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'dart:typed_data'; // Required for Uint8List (the byte array)
+import 'dart:convert';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Data Models  (lightweight, no external packages)
@@ -151,17 +152,41 @@ class _NewLimiterPageState extends State<NewLimiterPage> {
   List<_AppEntry> get _selectedApps =>
       _allApps.where((a) => a.selected).toList();
 
-  void _onSave() {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          'Limiter saved! (${_selectedApps.length} app(s) selected)',
-        ),
-        backgroundColor: const Color(0xFF00B686),
-      ),
-    );
-    Navigator.pop(context);
-  }
+  void _onSave() async {
+      if (_selectedApps.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Please select at least one app.')),
+        );
+        return;
+      }
+
+      // 1. Build the Configuration Payload
+      final config = {
+        'model': _selectedModel.name, // e.g., "sharedHourly"
+        'sharedBudget': _sharedBudgetMinutes,
+        'pin': '0000', // Hardcoded as requested
+        'packages': _selectedApps.map((a) => a.packageId).toList(),
+      };
+
+      final jsonString = jsonEncode(config);
+
+      // 2. Fire it over the bridge to start the Kotlin service
+      try {
+        await _channel.invokeMethod('saveLimiterConfig', jsonString);
+        
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Limiter Active! Monitoring ${_selectedApps.length} apps.'),
+              backgroundColor: const Color(0xFF00B686),
+            ),
+          );
+          Navigator.pop(context);
+        }
+      } catch (e) {
+        debugPrint("Failed to start native service: $e");
+      }
+    }
 
   // ── Section header ─────────────────────────────────────────────────────────
   Widget _sectionHeader(String title) => Padding(

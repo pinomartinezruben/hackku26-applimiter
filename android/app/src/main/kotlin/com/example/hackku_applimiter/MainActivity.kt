@@ -28,6 +28,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 
+//
+import android.content.Intent // Add this
+
 class MainActivity : FlutterActivity() {
     private val channelName = "uniqueChannelName"
 
@@ -47,6 +50,24 @@ class MainActivity : FlutterActivity() {
                         result.success(appsList)
                     }
                 }
+            }
+            // --- NEW: Handle Config Save and Start Service ---
+            else if (call.method == "saveLimiterConfig") {
+                val jsonString = call.arguments as String
+
+                // Save JSON natively
+                val prefs = getSharedPreferences("AppLimiterPrefs", Context.MODE_PRIVATE)
+                prefs.edit().putString("limiterConfig", jsonString).apply()
+
+                // Boot the Native Background Engine
+                val serviceIntent = Intent(this, LimiterService::class.java)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(serviceIntent)
+                } else {
+                    startService(serviceIntent)
+                }
+
+                result.success(true)
             }
             else {
                 result.notImplemented()
@@ -110,15 +131,18 @@ class MainActivity : FlutterActivity() {
 
     private fun evaluateUsageStatsPermission() {
         val appOps = getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
-        val mode = appOps.unsafeCheckOpNoThrow(
-            AppOpsManager.OPSTR_GET_USAGE_STATS,
-            Process.myUid(),
-            packageName
-        )
+
+        // Safely check permission based on the Android version of the user's phone
+        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            appOps.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), packageName)
+        } else {
+            @Suppress("DEPRECATION")
+            appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), packageName)
+        }
+
         if (mode == AppOpsManager.MODE_ALLOWED) {
             Log.d("UsageStatsCheck", "GRANTED: PACKAGE_USAGE_STATS is active")
-        }
-        else {
+        } else {
             promptForUsageStats()
         }
     }
